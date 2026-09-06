@@ -1,184 +1,580 @@
 """
-IP-SAKTI corpus ingestion script.
+IP-SAKTI Hybrid Corpus Ingestion
 
-Rebuilds backend/data/corpus.json from ALL PDFs found under:
+Supports:
+    1. Normal text PDFs        -> pypdf
+    2. Scanned/image PDFs      -> Poppler + Tesseract OCR
 
-    backend/data/ip/    -> domain "IP"
-    backend/data/tk/    -> domain "TK"   (searched recursively --
-                                            handles the nested
-                                            ip_sakti_tk_pipeline/... path)
-    backend/data/abs/   -> domain "ABS"
+Domains:
+    backend/data/ip/  -> IP
+    backend/data/tk/  -> TK
+    backend/data/abs/ -> ABS
 
-Run this from inside the `backend/` folder (same folder as main.py):
-
-    pip install pypdf
-    python ingest_corpus.py
-
-Output: backend/data/corpus.json (overwritten)
-
-This replaces whatever manual/partial process built corpus.json before.
-It is safe to re-run any time you add new PDFs.
+Output:
+    backend/data/corpus.json
 """
 
 import json
-import os
 import re
 import sys
 from pathlib import Path
 
+# ============================================================
+# DEPENDENCIES
+# ============================================================
+
 try:
     from pypdf import PdfReader
 except ImportError:
-    print("Missing dependency. Run: pip install pypdf")
+    print("ERROR: pypdf is missing.")
+    print("Run: pip install pypdf")
     sys.exit(1)
 
+try:
+    import pytesseract
+except ImportError:
+    print("ERROR: pytesseract is missing.")
+    print("Run: pip install pytesseract")
+    sys.exit(1)
+
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    print("ERROR: pdf2image is missing.")
+    print("Run: pip install pdf2image")
+    sys.exit(1)
+
+
+# ============================================================
+# PATHS
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_PATH = DATA_DIR / "corpus.json"
 
-# folder name (under data/) -> domain tag used everywhere in main.py
+
+# ============================================================
+# DOMAIN CONFIGURATION
+# ============================================================
+
 DOMAIN_FOLDERS = {
     "ip": "IP",
     "tk": "TK",
     "abs": "ABS",
 }
 
+
+# ============================================================
+# CHUNK CONFIGURATION
+# ============================================================
+
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 
 
+# ============================================================
+# POPPLER
+# ============================================================
+
+# Exact Poppler location found on this machine.
+POPPLER_BIN = Path(
+    r"C:\Users\Anshika Jain\AppData\Local\Microsoft\WinGet\Packages"
+    r"\oschwartz10612.Poppler_Microsoft.Winget.Source_8wekyb3d8bbwe"
+    r"\poppler-25.07.0\Library\bin"
+)
+
+
+# ============================================================
+# TEXT CLEANING
+# ============================================================
+
 def clean_text(text):
-    """Collapse whitespace/newlines the same way the existing corpus looks."""
-    text = text.replace("\n", " ").replace("\r", " ")
+    """
+    Normalize extracted/OCR text.
+    """
+
+    if not text:
+        return ""
+
+    text = text.replace("\x00", " ")
+    text = text.replace("\n", " ")
+    text = text.replace("\r", " ")
     text = re.sub(r"\s+", " ", text)
+
     return text.strip()
 
 
-def extract_pdf_text(pdf_path):
-    """Extract and concatenate text from every page of a PDF."""
+# ============================================================
+# NORMAL PDF EXTRACTION
+# ============================================================
+
+def extract_text_pdf(pdf_path):
+    """
+    Extract text from a normal text-based PDF.
+
+    Returns:
+        list of (page_number, text)
+    """
+
+    pages = []
+
     try:
         reader = PdfReader(str(pdf_path))
     except Exception as e:
-        print(f"  [SKIP] Could not open {pdf_path.name}: {e}")
-        return ""
+        print(f"  [ERROR] Could not open PDF: {e}")
+        return []
 
-    pages_text = []
-    for page in reader.pages:
+    for page_number, page in enumerate(reader.pages, start=1):
+
         try:
-            pages_text.append(page.extract_text() or "")
+            text = page.extract_text() or ""
         except Exception as e:
-            print(f"  [WARN] Could not extract a page in {pdf_path.name}: {e}")
+            print(
+                f"  [WARN] Could not extract "
+                f"page {page_number}: {e}"
+            )
+            text = ""
 
-    return clean_text(" ".join(pages_text))
+        text = clean_text(text)
+
+        if text:
+            pages.append(
+                (page_number, text)
+            )
+
+    return pages
 
 
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Simple sliding-window chunking, matching the existing corpus style."""
+# ============================================================
+# OCR EXTRACTION
+# ============================================================
+
+def extract_ocr_pdf(pdf_path):
+    """
+    Convert scanned PDF pages to images using Poppler
+    and extract text using Tesseract OCR.
+
+    Returns:
+        list of (page_number, text)
+    """
+
+    pages = []
+
+    print("  [OCR] Starting OCR...")
+
+    if not POPPLER_BIN.exists():
+        print(
+            f"  [ERROR] Poppler directory not found:\n"
+            f"  {POPPLER_BIN}"
+        )
+        return []
+
+    try:
+
+        images = convert_from_path(
+            str(pdf_path),
+            dpi=200,
+            poppler_path=str(POPPLER_BIN),
+            fmt="png",
+            thread_count=2,
+        )
+
+    except Exception as e:
+
+        print(
+            f"  [ERROR] PDF -> image conversion failed: {e}"
+        )
+
+        return []
+
+    total_pages = len(images)
+
+    print(
+        f"  [OCR] {total_pages} page(s) detected."
+    )
+
+    for page_number, image in enumerate(
+        images,
+        start=1
+    ):
+
+        try:
+
+            text = pytesseract.image_to_string(
+                image,
+                lang="eng",
+                config="--psm 6",
+            )
+
+        except Exception as e:
+
+            print(
+                f"  [WARN] OCR failed on "
+                f"page {page_number}: {e}"
+            )
+
+            text = ""
+
+        text = clean_text(text)
+
+        if text:
+
+            pages.append(
+                (page_number, text)
+            )
+
+        print(
+            f"    OCR page "
+            f"{page_number}/{total_pages}"
+        )
+
+    return pages
+
+
+# ============================================================
+# HYBRID PDF EXTRACTION
+# ============================================================
+
+def extract_pdf(pdf_path):
+    """
+    First try normal PDF text extraction.
+
+    If insufficient text is found,
+    automatically fall back to OCR.
+    """
+
+    print(
+        f"  Extracting text: {pdf_path.name}"
+    )
+
+    normal_pages = extract_text_pdf(
+        pdf_path
+    )
+
+    normal_text_length = sum(
+        len(text)
+        for _, text in normal_pages
+    )
+
+    # --------------------------------------------------------
+    # Normal PDF
+    # --------------------------------------------------------
+
+    if normal_text_length >= 100:
+
+        print(
+            f"  [TEXT] Extracted "
+            f"{normal_text_length:,} characters."
+        )
+
+        return normal_pages, "TEXT"
+
+    # --------------------------------------------------------
+    # Scanned PDF
+    # --------------------------------------------------------
+
+    print(
+        "  [TEXT] Little/no extractable text."
+    )
+
+    print(
+        "  [FALLBACK] Using OCR..."
+    )
+
+    ocr_pages = extract_ocr_pdf(
+        pdf_path
+    )
+
+    return ocr_pages, "OCR"
+
+
+# ============================================================
+# CHUNKING
+# ============================================================
+
+def chunk_text(
+    text,
+    chunk_size=CHUNK_SIZE,
+    overlap=CHUNK_OVERLAP,
+):
+    """
+    Sliding-window chunking.
+    """
+
     if not text:
         return []
 
     chunks = []
+
     start = 0
     length = len(text)
-    step = max(1, chunk_size - overlap)
+
+    step = max(
+        1,
+        chunk_size - overlap
+    )
 
     while start < length:
-        end = min(start + chunk_size, length)
-        chunk = text[start:end].strip()
+
+        end = min(
+            start + chunk_size,
+            length
+        )
+
+        chunk = text[
+            start:end
+        ].strip()
+
         if chunk:
-            chunks.append(chunk)
+            chunks.append(
+                chunk
+            )
+
         if end >= length:
             break
+
         start += step
 
     return chunks
 
 
-def find_pdfs_recursive(folder):
-    """Recursively find every .pdf under a folder (handles nested paths)."""
-    if not folder.exists():
-        print(f"  [MISSING] Folder does not exist: {folder}")
-        return []
-    return sorted(folder.rglob("*.pdf"))
+# ============================================================
+# FIND PDFs
+# ============================================================
 
+def find_pdfs_recursive(folder):
+    """
+    Recursively find all PDFs.
+    """
+
+    if not folder.exists():
+
+        print(
+            f"  [MISSING] {folder}"
+        )
+
+        return []
+
+    return sorted(
+        folder.rglob("*.pdf")
+    )
+
+
+# ============================================================
+# BUILD CORPUS
+# ============================================================
 
 def build_corpus():
+
     corpus = []
+
     summary = {}
 
     for folder_name, domain in DOMAIN_FOLDERS.items():
+
         folder = DATA_DIR / folder_name
-        pdf_files = find_pdfs_recursive(folder)
 
-        print(f"\n=== Domain: {domain}  (folder: {folder}) ===")
-        print(f"Found {len(pdf_files)} PDF file(s).")
+        pdf_files = find_pdfs_recursive(
+            folder
+        )
 
-        domain_chunk_count = 0
+        print()
+        print("=" * 70)
+        print(
+            f"DOMAIN: {domain}"
+        )
+        print(
+            f"FOLDER: {folder}"
+        )
+        print(
+            f"PDF FILES: {len(pdf_files)}"
+        )
+        print("=" * 70)
+
+        domain_chunks = 0
 
         for pdf_path in pdf_files:
-            filename = pdf_path.name
-            print(f"  Processing: {filename}")
 
-            text = extract_pdf_text(pdf_path)
-            if not text:
-                print(f"  [SKIP] No extractable text in {filename}")
+            print()
+            print(
+                f"Processing: {pdf_path.name}"
+            )
+
+            pages, extraction_method = extract_pdf(
+                pdf_path
+            )
+
+            if not pages:
+
+                print(
+                    "  [SKIP] No text extracted."
+                )
+
                 continue
 
-            chunks = chunk_text(text)
-            print(f"    -> {len(chunks)} chunk(s)")
+            file_chunks = 0
 
-            stem = filename.replace(".pdf", "").replace(".PDF", "")
+            for page_number, page_text in pages:
 
-            for i, chunk in enumerate(chunks):
-                corpus.append({
-                    "id": f"{domain.lower()}-{stem}-{i}",
-                    "domain": domain,
-                    "source": filename,
-                    "page_content": chunk,
-                    "metadata": {
-                        "filename": filename,
-                        "domain": domain,
-                        "chunk": i,
-                    },
-                })
-                domain_chunk_count += 1
+                chunks = chunk_text(
+                    page_text
+                )
+
+                for chunk_index, chunk in enumerate(
+                    chunks
+                ):
+
+                    stem = (
+                        pdf_path.stem
+                        .replace(".pdf", "")
+                    )
+
+                    record_id = (
+                        f"{domain.lower()}-"
+                        f"{stem}-"
+                        f"page-{page_number}-"
+                        f"chunk-{chunk_index}"
+                    )
+
+                    corpus.append(
+                        {
+                            "id": record_id,
+
+                            "domain": domain,
+
+                            "source": pdf_path.name,
+
+                            "page_content": chunk,
+
+                            "metadata": {
+                                "filename": pdf_path.name,
+                                "domain": domain,
+                                "page": page_number,
+                                "chunk": chunk_index,
+                                "extraction_method":
+                                    extraction_method,
+                                "source_path":
+                                    str(
+                                        pdf_path.relative_to(
+                                            BASE_DIR
+                                        )
+                                    ),
+                            },
+                        }
+                    )
+
+                    file_chunks += 1
+                    domain_chunks += 1
+
+            print(
+                f"  [{extraction_method}] "
+                f"{file_chunks} chunk(s)"
+            )
 
         summary[domain] = {
             "files": len(pdf_files),
-            "chunks": domain_chunk_count,
+            "chunks": domain_chunks,
         }
 
     return corpus, summary
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    print(f"Base dir:   {BASE_DIR}")
-    print(f"Data dir:   {DATA_DIR}")
-    print(f"Output:     {OUTPUT_PATH}")
+
+    print()
+    print("=" * 70)
+    print("IP-SAKTI CORPUS INGESTION")
+    print("=" * 70)
+
+    print(
+        f"Base directory : {BASE_DIR}"
+    )
+
+    print(
+        f"Data directory : {DATA_DIR}"
+    )
+
+    print(
+        f"Output         : {OUTPUT_PATH}"
+    )
+
+    print(
+        f"Poppler        : {POPPLER_BIN}"
+    )
+
+    print("=" * 70)
 
     if not DATA_DIR.exists():
-        print(f"\n[ERROR] {DATA_DIR} does not exist. "
-              f"Run this script from inside your backend/ folder.")
+
+        print(
+            "[ERROR] Data directory does not exist."
+        )
+
         sys.exit(1)
 
     corpus, summary = build_corpus()
 
     if not corpus:
-        print("\n[ERROR] No chunks were produced. corpus.json was NOT written. "
-              "Check the folder paths above.")
+
+        print()
+        print(
+            "[ERROR] No corpus chunks generated."
+        )
+
+        print(
+            "Check your PDFs and OCR installation."
+        )
+
         sys.exit(1)
 
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(corpus, f, ensure_ascii=False, indent=2)
+    # --------------------------------------------------------
+    # Write corpus
+    # --------------------------------------------------------
 
-    print("\n" + "=" * 50)
-    print("DONE")
-    print("=" * 50)
+    with open(
+        OUTPUT_PATH,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
+        json.dump(
+            corpus,
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    # --------------------------------------------------------
+    # Final summary
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("INGESTION COMPLETE")
+    print("=" * 70)
+
     for domain, stats in summary.items():
-        print(f"{domain}: {stats['files']} file(s), {stats['chunks']} chunk(s)")
-    print(f"Total chunks written: {len(corpus)}")
-    print(f"Written to: {OUTPUT_PATH}")
+
+        print(
+            f"{domain}: "
+            f"{stats['files']} file(s), "
+            f"{stats['chunks']} chunk(s)"
+        )
+
+    print(
+        f"TOTAL CHUNKS: {len(corpus)}"
+    )
+
+    print(
+        f"OUTPUT: {OUTPUT_PATH}"
+    )
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":

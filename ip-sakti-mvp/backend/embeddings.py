@@ -635,3 +635,17 @@ def semantic_search(
     return results[:top_k]
 EMBEDDINGS_AVAILABLE = True
 
+# =========================================================
+# QUERY EMBEDDING COMPATIBILITY
+# =========================================================
+
+def embed_query(text: str) -> List[float]:
+    """
+    Compatibility helper for the IP-SAKTI RAG retriever.
+
+    The TK retriever expects an embed_query() function.
+    Internally we use the same SentenceTransformer
+    embedding pipeline as embed_text().
+    """
+    return embed_text(text)
+
